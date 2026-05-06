@@ -92,6 +92,13 @@ struct Shared {
     /// Indicates whether the blocked on thread was woken.
     woken: AtomicBool,
 
+    /// Optional external wake notifier function pointer.
+    /// When non-null, called on every task wake so an external event loop
+    /// knows to call poll_once(). The pointer is a `fn()` cast to `*mut ()`.
+    /// Platform-independent: the callback implementation decides how to
+    /// notify (pipe on Unix, socket pair on Windows, etc.).
+    wake_notify_fn: std::sync::atomic::AtomicPtr<()>,
+
     /// Scheduler configuration options
     config: Config,
 
@@ -159,6 +166,7 @@ impl CurrentThread {
                 inject: Inject::new(),
                 owned: OwnedTasks::new(1),
                 woken: AtomicBool::new(false),
+                wake_notify_fn: std::sync::atomic::AtomicPtr::new(std::ptr::null_mut()),
                 config,
                 scheduler_metrics: SchedulerMetrics::new(),
                 worker_metrics,
@@ -239,6 +247,90 @@ impl CurrentThread {
             }),
             scheduler: self,
         })
+    }
+
+    /// Run one non-blocking iteration of the scheduler.
+    ///
+    /// Processes any ready tasks and checks for I/O events without blocking.
+    /// Set or clear the external wake notification callback.
+    pub(crate) fn set_wake_callback(&self, handle: &scheduler::Handle, callback: Option<fn()>) {
+        let handle_ct = handle.as_current_thread();
+        let ptr = match callback {
+            Some(f) => f as *mut (),
+            None => std::ptr::null_mut(),
+        };
+        handle_ct.shared.wake_notify_fn.store(ptr, Release);
+    }
+
+    /// Returns:
+    /// - `0` if there is work ready right now
+    /// - `-1` if no pending work and no timers
+    /// - `>0` milliseconds until the next timer fires
+    pub(crate) fn poll_once(&self, handle: &scheduler::Handle) -> i64 {
+        let handle_ct = handle.as_current_thread();
+
+        // Reset the woken flag so subsequent task wakes will trigger the
+        // wake callback again. Without this, the flag stays true after the
+        // first wake and all later notifications are suppressed.
+        handle_ct.reset_woken();
+
+        let core = match self.take_core(handle_ct) {
+            Some(core) => core,
+            None => return -1,
+        };
+
+        // Enter the runtime context (sets up I/O driver, timer, etc.)
+        // then use CoreGuard::enter for the scheduler context.
+        crate::runtime::context::enter_runtime(handle, false, |_blocking| {
+            core.enter(|mut core, context| {
+                // Process ready tasks (one batch)
+                for _ in 0..core.global_queue_interval {
+                    core.tick();
+                    let entry = core.next_task(&context.handle);
+                    match entry {
+                        Some(task) => {
+                            let task = context.handle.shared.owned.assert_owner(task);
+                            let (c, ()) = context.run_task(core, || {
+                                task.run();
+                            });
+                            core = c;
+                        }
+                        None => break,
+                    }
+                }
+
+                // Check for I/O events (non-blocking)
+                core = context.park_yield(core, &context.handle);
+
+                if context.has_pending_work(&core) {
+                    // Work is ready right now — notify the host to tick again
+                    let notify_fn = context.handle.shared.wake_notify_fn.load(Acquire);
+                    if !notify_fn.is_null() {
+                        let f: fn() = unsafe { std::mem::transmute(notify_fn) };
+                        f();
+                    }
+                    (core, 0i64)
+                } else {
+                    // Check for next timer deadline
+                    let next_timer_ms = Self::next_timer_ms(&context.handle);
+                    (core, next_timer_ms)
+                }
+            })
+        })
+    }
+
+    /// Returns milliseconds until the next timer, or -1 if no timers.
+    fn next_timer_ms(handle: &Arc<Handle>) -> i64 {
+        let driver = &handle.driver;
+        match driver.time.as_ref() {
+            Some(time_handle) => {
+                match time_handle.next_wake_duration(driver.clock()) {
+                    Some(duration) => duration.as_millis() as i64,
+                    None => -1,
+                }
+            }
+            None => -1,
+        }
     }
 
     pub(crate) fn shutdown(&mut self, handle: &scheduler::Handle) {
@@ -736,6 +828,13 @@ impl Wake for Handle {
         let already_woken = arc_self.shared.woken.swap(true, Release);
 
         if !already_woken {
+            // Notify external event loop if a callback is registered
+            let notify_fn = arc_self.shared.wake_notify_fn.load(Acquire);
+            if !notify_fn.is_null() {
+                let f: fn() = unsafe { std::mem::transmute(notify_fn) };
+                f();
+            }
+
             use scheduler::Context::CurrentThread;
 
             // If we are already running on the runtime, then it's not required to wake up the

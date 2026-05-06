@@ -13,6 +13,23 @@ impl Handle {
         &self.time_source
     }
 
+    /// Returns the duration until the next timer fires, or None if no timers.
+    pub(crate) fn next_wake_duration(&self, clock: &crate::time::Clock) -> Option<std::time::Duration> {
+        let lock = self.inner.lock();
+        match lock.next_wake {
+            Some(tick) => {
+                let now = self.time_source.now(clock);
+                let tick_val = tick.get();
+                if tick_val <= now {
+                    Some(std::time::Duration::ZERO)
+                } else {
+                    Some(self.time_source.tick_to_duration(tick_val - now))
+                }
+            }
+            None => None,
+        }
+    }
+
     /// Checks whether the driver has been shutdown.
     pub(super) fn is_shutdown(&self) -> bool {
         self.inner.is_shutdown()

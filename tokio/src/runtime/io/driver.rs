@@ -49,6 +49,10 @@ pub(crate) struct Handle {
     #[cfg(not(target_os = "wasi"))]
     waker: mio::Waker,
 
+    /// Optional callback invoked after I/O events are processed.
+    /// Used by external event loops to be notified when I/O wakes tasks.
+    pub(crate) io_notify_fn: std::sync::atomic::AtomicPtr<()>,
+
     pub(crate) metrics: IoDriverMetrics,
 
     #[cfg(all(
@@ -134,6 +138,7 @@ impl Driver {
             synced: Mutex::new(synced),
             #[cfg(not(target_os = "wasi"))]
             waker,
+            io_notify_fn: std::sync::atomic::AtomicPtr::new(std::ptr::null_mut()),
             metrics: IoDriverMetrics::default(),
             #[cfg(all(
                 tokio_unstable,
@@ -236,6 +241,15 @@ impl Driver {
         }
 
         handle.metrics.incr_ready_count_by(ready_count);
+
+        // Notify external event loop if I/O events woke tasks
+        if ready_count > 0 {
+            let notify_fn = handle.io_notify_fn.load(std::sync::atomic::Ordering::Acquire);
+            if !notify_fn.is_null() {
+                let f: fn() = unsafe { std::mem::transmute(notify_fn) };
+                f();
+            }
+        }
     }
 }
 
@@ -246,6 +260,16 @@ impl fmt::Debug for Driver {
 }
 
 impl Handle {
+    /// Returns the raw file descriptor of the underlying mio registry (epoll/kqueue).
+    ///
+    /// This can be monitored by an external event loop to know when I/O events
+    /// are available for processing.
+    #[cfg(unix)]
+    pub(crate) fn registry_fd(&self) -> std::os::unix::io::RawFd {
+        use std::os::unix::io::AsRawFd;
+        self.registry.as_raw_fd()
+    }
+
     /// Forces a reactor blocked in a call to `turn` to wakeup, or otherwise
     /// makes the next call to `turn` return immediately.
     ///

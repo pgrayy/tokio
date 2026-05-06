@@ -492,6 +492,84 @@ impl Runtime {
     pub fn metrics(&self) -> crate::runtime::RuntimeMetrics {
         self.handle.metrics()
     }
+
+    /// Returns the raw file descriptor of the I/O reactor's epoll/kqueue instance.
+    ///
+    /// External event loops (e.g., Python's asyncio) can monitor this fd to know
+    /// when the runtime has I/O events to process. When the fd is readable, call
+    /// [`poll_once`](Self::poll_once) to advance the runtime.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the runtime was built without I/O enabled.
+    #[cfg(all(unix, feature = "net"))]
+    pub fn io_fd(&self) -> std::os::unix::io::RawFd {
+        let driver_handle = self.handle.inner.driver();
+        let io_handle = driver_handle.io();
+        io_handle.registry_fd()
+    }
+
+    /// Run one non-blocking iteration of the runtime's event loop.
+    ///
+    /// This processes any ready tasks and checks for new I/O events without
+    /// blocking. Returns the number of milliseconds until the next timer fires,
+    /// or special values:
+    /// - `0`: there is work ready right now (call again immediately)
+    /// - `-1`: no pending work and no timers (sleep until fd event)
+    /// - `>0`: next timer fires in this many milliseconds
+    ///
+    /// This is designed for integration with external event loops: the host
+    /// calls `poll_once()` whenever the [`io_fd`](Self::io_fd) signals readiness
+    /// or when the returned timeout expires.
+    ///
+    /// # Panics
+    ///
+    /// Panics if called from within an async context or if the runtime is
+    /// not a `current_thread` runtime.
+    pub fn poll_once(&self) -> i64 {
+        match &self.scheduler {
+            Scheduler::CurrentThread(current_thread) => {
+                current_thread.poll_once(&self.handle.inner)
+            }
+            #[cfg(feature = "rt-multi-thread")]
+            _ => panic!("poll_once is only supported on current_thread runtimes"),
+        }
+    }
+
+    /// Set a callback that is invoked whenever a task is woken or I/O events
+    /// are processed.
+    ///
+    /// This enables external event loops to be notified when `poll_once()` should
+    /// be called. The callback is invoked for:
+    /// - Task wakes (spawns, timer fires, channel sends)
+    /// - I/O events (socket data arrives, connection completes)
+    ///
+    /// The callback should be cheap (e.g., write a byte to a socket/pipe).
+    /// Pass `None` to clear the callback.
+    ///
+    /// # Safety
+    ///
+    /// The callback must remain valid for the lifetime of the runtime.
+    pub fn set_wake_callback(&self, callback: Option<fn()>) {
+        let ptr = match callback {
+            Some(f) => f as *mut (),
+            None => std::ptr::null_mut(),
+        };
+
+        match &self.scheduler {
+            Scheduler::CurrentThread(current_thread) => {
+                current_thread.set_wake_callback(&self.handle.inner, callback);
+            }
+            #[cfg(feature = "rt-multi-thread")]
+            _ => panic!("set_wake_callback is only supported on current_thread runtimes"),
+        }
+
+        // Also set on the I/O driver handle so I/O events trigger notification
+        let driver_handle = self.handle.inner.driver();
+        if let Some(io_handle) = driver_handle.io.as_ref() {
+            io_handle.io_notify_fn.store(ptr, std::sync::atomic::Ordering::Release);
+        }
+    }
 }
 
 impl Drop for Runtime {

@@ -1,0 +1,16 @@
+[package]
+name = "tokio_driven"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+tokio = { path = "../../tokio", features = ["full"] }
+libc = "0.2"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = ["Win32_Networking_WinSock"] }
+
+[workspace]

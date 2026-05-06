@@ -1,0 +1,41 @@
+name: External Event Loop Test
+
+on:
+  push:
+    branches: [external-event-loop]
+  pull_request:
+    branches: [external-event-loop]
+
+jobs:
+  test:
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Build library
+        working-directory: examples/external-event-loop
+        run: cargo build --release
+
+      - name: Run test (Unix)
+        if: runner.os != 'Windows'
+        working-directory: examples/external-event-loop
+        run: python host.py
+        timeout-minutes: 1
+
+      - name: Run test (Windows)
+        if: runner.os == 'Windows'
+        working-directory: examples/external-event-loop
+        run: python host.py
+        timeout-minutes: 1
